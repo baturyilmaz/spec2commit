@@ -1,0 +1,8 @@
+node_modules/
+dist/
+lib/
+ref/
+.spec2commit/
+.cursor/
+.agents/
+*.tsbuildinfo
