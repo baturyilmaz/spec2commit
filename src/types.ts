@@ -1,6 +1,18 @@
 import { z } from 'zod';
 import { MAX_REVIEWS } from './config.js';
 
+export type ModelType = 'codex' | 'claude';
+
+export interface ModelConfig {
+  planner: ModelType;
+  reviewer: ModelType;
+}
+
+export const DEFAULT_MODEL_CONFIG: ModelConfig = {
+  planner: 'claude',
+  reviewer: 'codex',
+};
+
 export type PipeMsg =
   | { kind: 'banner'; stage: string; agent: string; detail?: string }
   | { kind: 'progress'; activeIdx: number }
@@ -11,7 +23,7 @@ export type PipeMsg =
   | { kind: 'text'; agent: string; text: string }
   | { kind: 'status'; text: string }
   | { kind: 'tool'; agent: string; tool: string; detail?: string }
-  | { kind: 'agent_switch'; agent: 'codex' | 'claude' }
+  | { kind: 'agent_switch'; agent: ModelType }
   | { kind: 'duration'; session: string; codex: string; claude: string }
   | { kind: 'stage_summary'; stage: string; verdict?: string; attempt?: string; elapsed?: string; detail?: string };
 
@@ -52,12 +64,16 @@ export function transitionTo(s: State, next: Stage): boolean {
 
 export interface Evt {
   type: 'text' | 'tool_use' | 'tool_result' | 'status' | 'error';
-  agent: 'codex' | 'claude';
+  agent: ModelType;
   content: string;
   detail?: string;
 }
 
 export interface State {
+  id: string;
+  name: string | null;
+  createdAt: number;
+  modifiedAt: number;
   projectPath: string;
   codexThreadId: string | null;
   claudeSessionId: string | null;
@@ -68,18 +84,26 @@ export interface State {
   feedback: string | null;
   planReviews: number;
   implReviews: number;
-  log: { role: 'user' | 'codex'; content: string; ts: string }[];
+  log: { role: 'user' | 'codex' | 'claude'; content: string; ts: string }[];
   startedAt: number | null;
   codexMs: number;
   claudeMs: number;
   cancelled: boolean;
   autoApprove: boolean;
+  models: ModelConfig;
+}
+
+export interface SessionStore {
+  version: number;
+  activeSessionId: string | null;
+  sessions: State[];
 }
 
 export interface CodexResult {
   threadId: string;
   message: string;
 }
+
 export interface ClaudeResult {
   result: string;
   fullText: string;
@@ -96,7 +120,7 @@ export type Gate = z.infer<typeof GateSchema>;
 
 export type ItemData =
   | { kind: 'user'; content: string }
-  | { kind: 'agent'; agent: 'codex' | 'claude'; content: string }
+  | { kind: 'agent'; agent: ModelType; content: string }
   | { kind: 'system'; variant: 'ok' | 'warn' | 'error'; text: string }
   | { kind: 'info'; text: string }
   | { kind: 'tools'; tools: Array<{ tool: string; detail?: string }> }

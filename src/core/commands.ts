@@ -2,9 +2,30 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import figures from 'figures';
 import { execClaude, execCodex, killAllRunners } from './runners.js';
-import { Stage, MAX_REVIEWS, type State, type ItemData, type Item } from '../types.js';
+import { Stage, MAX_REVIEWS, type State, type ItemData, type Item, type ModelType } from '../types.js';
 import { fmtMs } from '../ui/format.js';
 import { initClaude, initCodex } from './prompts.js';
+import {
+  listSessions,
+  switchSession,
+  deleteSession,
+  renameSession,
+  getOrCreateSession,
+  save,
+} from './store.js';
+
+export function getSessionTitle(sess: { name: string | null; spec: string | null }): string {
+  if (sess.name) return sess.name;
+  if (!sess.spec) return 'untitled';
+  
+  const firstLine = sess.spec.split('\n')[0] || '';
+  const cleaned = firstLine
+    .replace(/^(Title:|#|\*)+\s*/i, '')
+    .trim();
+  
+  const words = cleaned.split(/\s+/).slice(0, 5).join(' ');
+  return words.slice(0, 40) || 'untitled';
+}
 
 export interface CommandCtx {
   s: State;
@@ -13,13 +34,14 @@ export interface CommandCtx {
   mutate: (fn: (s: State) => void) => void;
   runPipe: () => void;
   setThinkStartedAt: (v: number) => void;
-  setActiveAgent: (a: 'codex' | 'claude') => void;
+  setActiveAgent: (a: ModelType) => void;
   setBusy: (b: boolean) => void;
   setCurrentStage: (s: string) => void;
   setItems: (items: Item[]) => void;
   setLiveTools: (fn: (prev: Array<{ id: number; tool: string; detail?: string }>) => typeof prev) => void;
   genId: () => number;
   exit: () => void;
+  loadSession: (session: State) => void;
 }
 
 export async function handleCommand(input: string, ctx: CommandCtx) {
@@ -37,6 +59,7 @@ export async function handleCommand(input: string, ctx: CommandCtx) {
     setLiveTools,
     genId,
     exit,
+    loadSession,
   } = ctx;
   const parts = input.split(' ');
   const c = parts[0];
@@ -49,35 +72,56 @@ export async function handleCommand(input: string, ctx: CommandCtx) {
       const claudeMdExists = existsSync(join(s.projectPath, 'CLAUDE.md'));
       const agentsMdExists = existsSync(join(s.projectPath, 'AGENTS.md'));
       const verb = (exists: boolean) => (exists ? 'Updating' : 'Generating');
+
+      const useClaude = s.models.planner === 'claude';
+      const useCodex = s.models.planner === 'codex';
+
+      const tasks: string[] = [];
+      if (useClaude) tasks.push(`${verb(claudeMdExists)} CLAUDE.md`);
+      if (useCodex) tasks.push(`${verb(agentsMdExists)} AGENTS.md`);
+
       addItem({
         kind: 'system',
         variant: 'ok',
-        text: `${verb(claudeMdExists)} CLAUDE.md + ${verb(agentsMdExists)} AGENTS.md...`,
+        text: `${tasks.join(' + ')}...`,
       });
       setThinkStartedAt(Date.now());
-      setActiveAgent('claude');
+      setActiveAgent(s.models.planner);
       setBusy(true);
 
-      Promise.allSettled([
-        execClaude(initClaude(claudeMdExists), { cwd: s.projectPath, sessionId: s.claudeSessionId ?? undefined }),
-        execCodex(initCodex(agentsMdExists), { cwd: s.projectPath }),
-      ]).then(([claudeRes, codexRes]) => {
-        if (claudeRes.status === 'fulfilled') {
-          mutate((st) => {
-            st.claudeSessionId = claudeRes.value.sessionId;
-          });
-          addItem({ kind: 'system', variant: 'ok', text: `${claudeMdExists ? 'Updated' : 'Generated'} CLAUDE.md` });
-        } else {
-          addItem({ kind: 'system', variant: 'error', text: `CLAUDE.md failed: ${claudeRes.reason}` });
-        }
-        if (codexRes.status === 'fulfilled') {
-          mutate((st) => {
-            st.codexThreadId = codexRes.value.threadId;
-          });
-          addItem({ kind: 'system', variant: 'ok', text: `${agentsMdExists ? 'Updated' : 'Generated'} AGENTS.md` });
-        } else {
-          addItem({ kind: 'system', variant: 'error', text: `AGENTS.md failed: ${codexRes.reason}` });
-        }
+      const promises: Promise<unknown>[] = [];
+
+      if (useClaude) {
+        promises.push(
+          execClaude(initClaude(claudeMdExists), { cwd: s.projectPath, sessionId: s.claudeSessionId ?? undefined })
+            .then((claudeRes) => {
+              mutate((st) => {
+                st.claudeSessionId = claudeRes.sessionId;
+              });
+              addItem({ kind: 'system', variant: 'ok', text: `${claudeMdExists ? 'Updated' : 'Generated'} CLAUDE.md` });
+            })
+            .catch((err) => {
+              addItem({ kind: 'system', variant: 'error', text: `CLAUDE.md failed: ${err}` });
+            })
+        );
+      }
+
+      if (useCodex) {
+        promises.push(
+          execCodex(initCodex(agentsMdExists), { cwd: s.projectPath })
+            .then((codexRes) => {
+              mutate((st) => {
+                st.codexThreadId = codexRes.threadId;
+              });
+              addItem({ kind: 'system', variant: 'ok', text: `${agentsMdExists ? 'Updated' : 'Generated'} AGENTS.md` });
+            })
+            .catch((err) => {
+              addItem({ kind: 'system', variant: 'error', text: `AGENTS.md failed: ${err}` });
+            })
+        );
+      }
+
+      Promise.allSettled(promises).finally(() => {
         setThinkStartedAt(0);
         setBusy(false);
       });
@@ -174,70 +218,134 @@ export async function handleCommand(input: string, ctx: CommandCtx) {
       runPipe();
       break;
     }
-    case '/claude': {
-      const msg = parts.slice(1).join(' ').trim();
-      if (!msg) {
-        addItem({ kind: 'system', variant: 'warn', text: 'Usage: /claude <message>' });
-        break;
-      }
-      if (busy) {
-        addItem({ kind: 'system', variant: 'warn', text: 'Already running.' });
-        break;
-      }
-      addItem({ kind: 'user', content: msg });
-      setThinkStartedAt(Date.now());
-      setActiveAgent('claude');
-      setBusy(true);
-      setLiveTools(() => []);
-
-      const collectedTools: Array<{ tool: string; detail?: string }> = [];
-      const onEvent = (evt: import('../types.js').Evt) => {
-        if (evt.type === 'tool_use') {
-          collectedTools.push({ tool: evt.content, detail: evt.detail });
-          setLiveTools((prev) => [...prev.slice(-4), { id: genId(), tool: evt.content, detail: evt.detail }]);
-        }
-      };
-
-      try {
-        const r = await execClaude(msg, {
-          cwd: s.projectPath,
-          sessionId: s.claudeSessionId ?? undefined,
-          onEvent,
-        });
-        mutate((st) => {
-          st.claudeSessionId = r.sessionId;
-        });
-        if (collectedTools.length > 0) addItem({ kind: 'tools', tools: collectedTools });
-        addItem({ kind: 'agent', agent: 'claude', content: r.result });
-      } catch (e) {
-        addItem({ kind: 'system', variant: 'error', text: e instanceof Error ? e.message : String(e) });
-      } finally {
-        setThinkStartedAt(0);
-        setBusy(false);
-        setLiveTools(() => []);
-      }
-      break;
-    }
     case '/spec':
       if (!s.spec) {
         addItem({ kind: 'system', variant: 'warn', text: 'No spec yet.' });
         break;
       }
-      addItem({ kind: 'agent', agent: 'codex', content: s.spec });
+      addItem({ kind: 'agent', agent: s.models.reviewer, content: s.spec });
       break;
     case '/plan':
       if (!s.plan) {
         addItem({ kind: 'system', variant: 'warn', text: 'No plan yet.' });
         break;
       }
-      addItem({ kind: 'agent', agent: 'claude', content: s.plan });
+      addItem({ kind: 'agent', agent: s.models.planner, content: s.plan });
       break;
-    case '/session':
-      addItem({
-        kind: 'info',
-        text: `Codex: ${s.codexThreadId ?? 'none'} ${figures.pointerSmall} Claude: ${s.claudeSessionId ?? 'none'}`,
-      });
+    case '/session': {
+      const subCmd = parts[1]?.toLowerCase();
+      
+      if (!subCmd) {
+        addItem({
+          kind: 'info',
+          text: `Session: ${s.id} ${s.name ? `(${s.name})` : ''}`,
+        });
+        addItem({
+          kind: 'info',
+          text: `Codex: ${s.codexThreadId ?? 'none'} ${figures.pointerSmall} Claude: ${s.claudeSessionId ?? 'none'}`,
+        });
+        addItem({
+          kind: 'info',
+          text: 'Commands: /session list | switch <id> | new | delete <id> | rename <name>',
+        });
+        break;
+      }
+
+      if (subCmd === 'list') {
+        const sessions = listSessions();
+        if (sessions.length === 0) {
+          addItem({ kind: 'info', text: 'No sessions.' });
+        } else {
+          addItem({ kind: 'info', text: `Sessions (${sessions.length}):` });
+          for (const sess of sessions.slice(0, 10)) {
+            const isCurrent = sess.id === s.id;
+            const title = getSessionTitle(sess);
+            const status = sess.stage === 'DONE' ? '✓' : sess.stage === 'PAUSED' ? '⏸' : '○';
+            const prefix = isCurrent ? '→ ' : '  ';
+            addItem({
+              kind: isCurrent ? 'system' : 'info',
+              variant: isCurrent ? 'ok' : undefined,
+              text: `${prefix}${status} ${sess.id} ${title} (${sess.log.length} msgs)`,
+            } as ItemData);
+          }
+          if (sessions.length > 10) {
+            addItem({ kind: 'info', text: `  ... and ${sessions.length - 10} more` });
+          }
+        }
+        break;
+      }
+
+      if (subCmd === 'switch') {
+        const targetId = parts[2];
+        if (!targetId) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Usage: /session switch <id>' });
+          break;
+        }
+        if (busy) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Cannot switch while running.' });
+          break;
+        }
+        const target = switchSession(targetId);
+        if (!target) {
+          addItem({ kind: 'system', variant: 'error', text: `Session not found: ${targetId}` });
+          break;
+        }
+        loadSession(target);
+        addItem({ kind: 'system', variant: 'ok', text: `Switched to session ${targetId}` });
+        break;
+      }
+
+      if (subCmd === 'new') {
+        if (busy) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Cannot create while running.' });
+          break;
+        }
+        save(s);
+        const newSess = getOrCreateSession(s.projectPath, s.models);
+        if (newSess.id !== s.id) {
+          loadSession(newSess);
+          addItem({ kind: 'system', variant: 'ok', text: `New session: ${newSess.id}` });
+        } else {
+          addItem({ kind: 'info', text: 'Current session is empty, reusing it.' });
+        }
+        break;
+      }
+
+      if (subCmd === 'delete') {
+        const targetId = parts[2];
+        if (!targetId) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Usage: /session delete <id>' });
+          break;
+        }
+        if (targetId === s.id) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Cannot delete current session.' });
+          break;
+        }
+        if (deleteSession(targetId)) {
+          addItem({ kind: 'system', variant: 'ok', text: `Deleted session ${targetId}` });
+        } else {
+          addItem({ kind: 'system', variant: 'error', text: `Session not found: ${targetId}` });
+        }
+        break;
+      }
+
+      if (subCmd === 'rename') {
+        const newName = parts.slice(2).join(' ').trim();
+        if (!newName) {
+          addItem({ kind: 'system', variant: 'warn', text: 'Usage: /session rename <name>' });
+          break;
+        }
+        mutate((st) => {
+          st.name = newName;
+        });
+        renameSession(s.id, newName);
+        addItem({ kind: 'system', variant: 'ok', text: `Session renamed to: ${newName}` });
+        break;
+      }
+
+      addItem({ kind: 'system', variant: 'warn', text: 'Unknown subcommand. Use: list | switch | new | delete | rename' });
       break;
+    }
     case '/status':
       addItem({
         kind: 'info',
@@ -249,6 +357,39 @@ export async function handleCommand(input: string, ctx: CommandCtx) {
         text: `${s.startedAt ? fmtMs(Date.now() - s.startedAt) : ''} ${figures.pointerSmall} codex ${fmtMs(s.codexMs)} ${figures.pointerSmall} claude ${fmtMs(s.claudeMs)}`,
       });
       break;
+    case '/config': {
+      const arg = parts[1]?.toLowerCase();
+      const value = parts[2]?.toLowerCase() as ModelType | undefined;
+
+      if (!arg) {
+        addItem({
+          kind: 'info',
+          text: `Models: planner=${s.models.planner} reviewer=${s.models.reviewer}`,
+        });
+        addItem({
+          kind: 'info',
+          text: 'Usage: /config planner|reviewer codex|claude',
+        });
+        break;
+      }
+
+      if (arg !== 'planner' && arg !== 'reviewer') {
+        addItem({ kind: 'system', variant: 'warn', text: 'Usage: /config planner|reviewer codex|claude' });
+        break;
+      }
+
+      if (!value || (value !== 'codex' && value !== 'claude')) {
+        addItem({ kind: 'system', variant: 'warn', text: 'Model must be codex or claude' });
+        break;
+      }
+
+      mutate((st) => {
+        st.models[arg] = value;
+      });
+      save(s);
+      addItem({ kind: 'system', variant: 'ok', text: `${arg} set to ${value}` });
+      break;
+    }
     case '/reset':
       mutate((st) => {
         Object.assign(st, {
@@ -279,7 +420,7 @@ export async function handleCommand(input: string, ctx: CommandCtx) {
     case '/help':
       addItem({
         kind: 'info',
-        text: '/go  /claude  /init  /pause  /cancel  /resume  /accept  /spec  /plan  /session  /status  /reset  /clear  /quit',
+        text: '/go  /init  /config  /session  /pause  /cancel  /resume  /accept  /spec  /plan  /status  /reset  /clear  /quit',
       });
       break;
     case '/quit':

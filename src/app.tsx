@@ -4,7 +4,7 @@ import figures from 'figures';
 import { execCodex, killAllRunners } from './core/runners.js';
 import { runPipeline } from './core/pipeline.js';
 import { save } from './core/store.js';
-import { type State, type Evt, type PipeMsg, type ItemData, type Item } from './types.js';
+import { type State, type Evt, type PipeMsg, type ItemData, type Item, type ModelType } from './types.js';
 import { T } from './ui/theme.js';
 import { fmtMs, setWidth } from './ui/format.js';
 import { SYSTEM, CHAT_REMINDER } from './core/prompts.js';
@@ -21,10 +21,15 @@ import { PromptInput } from './ui/components/prompt-input.js';
 import { StageProgress } from './ui/components/stage-progress.js';
 import { StatusLine } from './ui/components/status-line.js';
 
+type StateAction = { type: 'mutate'; fn: (draft: State) => void } | { type: 'replace'; state: State };
+
 function useStateManager(initial: State) {
-  const [state, dispatch] = useReducer((prev: State, fn: (draft: State) => void) => {
+  const [state, dispatch] = useReducer((prev: State, action: StateAction) => {
+    if (action.type === 'replace') {
+      return action.state;
+    }
     const next = { ...prev, log: [...prev.log] };
-    fn(next);
+    action.fn(next);
     return next;
   }, initial);
 
@@ -34,7 +39,15 @@ function useStateManager(initial: State) {
     return () => clearTimeout(saveTimer.current);
   }, [state]);
 
-  return [state, dispatch] as const;
+  const mutate = useCallback((fn: (draft: State) => void) => {
+    dispatch({ type: 'mutate', fn });
+  }, []);
+
+  const replaceState = useCallback((newState: State) => {
+    dispatch({ type: 'replace', state: newState });
+  }, []);
+
+  return [state, mutate, replaceState] as const;
 }
 
 export function App({ state: initial }: { state: State }) {
@@ -46,7 +59,7 @@ export function App({ state: initial }: { state: State }) {
     setWidth(Math.min(cols, MAX_WIDTH));
   }, [stdout?.columns]);
 
-  const [s, mutate] = useStateManager(
+  const [s, mutate, replaceState] = useStateManager(
     (() => {
       if (!initial.startedAt) initial.startedAt = Date.now();
       return initial;
@@ -70,14 +83,14 @@ export function App({ state: initial }: { state: State }) {
     }
     for (const msg of recent) {
       if (msg.role === 'user') seed.push({ id: nextIdRef.current++, kind: 'user', content: msg.content });
-      else seed.push({ id: nextIdRef.current++, kind: 'agent', agent: 'codex', content: msg.content });
+      else seed.push({ id: nextIdRef.current++, kind: 'agent', agent: msg.role as ModelType, content: msg.content });
     }
     return seed;
   });
 
   const [busy, setBusy] = useState(false);
   const [thinkStartedAt, setThinkStartedAt] = useState(0);
-  const [activeAgent, setActiveAgent] = useState<'codex' | 'claude'>('codex');
+  const [activeAgent, setActiveAgent] = useState<ModelType>('codex');
   const [liveTools, setLiveTools] = useState<Array<{ id: number; tool: string; detail?: string }>>([]);
   const [currentStage, setCurrentStage] = useState<string>(s.stage);
   const streamRef = useRef('');
@@ -103,9 +116,6 @@ export function App({ state: initial }: { state: State }) {
       }
       if (msg.kind === 'banner' || msg.kind === 'stage_summary') {
         setCurrentStage(msg.stage);
-        if (msg.kind === 'banner') {
-          setActiveAgent(msg.agent === 'claude' ? 'claude' : 'codex');
-        }
       }
       addItem({ kind: 'pipe', msg });
     },
@@ -142,7 +152,7 @@ export function App({ state: initial }: { state: State }) {
   const runPipe = useCallback(async () => {
     setBusy(true);
     setThinkStartedAt(Date.now());
-    setActiveAgent('codex');
+    setActiveAgent(s.models.planner);
     try {
       const ev = await runPipeline(s, pipeCallback);
       syncPipelineState();
@@ -172,6 +182,30 @@ export function App({ state: initial }: { state: State }) {
     }
   }, [s, addItem, pipeCallback, syncPipelineState]);
 
+  const loadSession = useCallback(
+    (session: State) => {
+      replaceState(session);
+      setCurrentStage(session.stage);
+      setItems([]);
+      const seed: Item[] = [];
+      seed.push({ id: genId(), kind: 'info', text: `Session: ${session.id} ${session.name ? `(${session.name})` : ''}` });
+      const recent = session.log.slice(-10);
+      if (recent.length < session.log.length) {
+        seed.push({
+          id: genId(),
+          kind: 'info',
+          text: `... ${session.log.length - recent.length} earlier messages`,
+        });
+      }
+      for (const msg of recent) {
+        if (msg.role === 'user') seed.push({ id: genId(), kind: 'user', content: msg.content });
+        else seed.push({ id: genId(), kind: 'agent', agent: msg.role as ModelType, content: msg.content });
+      }
+      setItems(seed);
+    },
+    [replaceState, genId],
+  );
+
   const handleSubmit = useCallback(
     async (input: string) => {
       if (input.startsWith('/')) {
@@ -189,6 +223,7 @@ export function App({ state: initial }: { state: State }) {
           setLiveTools: (fn) => setLiveTools(fn),
           genId,
           exit,
+          loadSession,
         };
         await handleCommand(input, cmdCtx);
         return;
@@ -252,6 +287,7 @@ export function App({ state: initial }: { state: State }) {
       setCurrentStage,
       setItems,
       exit,
+      loadSession,
     ],
   );
 
@@ -291,7 +327,7 @@ export function App({ state: initial }: { state: State }) {
 
       <Box flexDirection="column" width="100%" marginTop={1}>
         <StageProgress stage={busy ? currentStage : s.stage} startedAt={s.startedAt} />
-        <StatusLine project={shortPath} codexId={s.codexThreadId} autoApprove={s.autoApprove} />
+        <StatusLine project={shortPath} codexId={s.codexThreadId} autoApprove={s.autoApprove} models={s.models} />
         <PromptInput onSubmit={handleSubmit} isActive={thinkStartedAt === 0 && !busy} />
       </Box>
     </Box>
