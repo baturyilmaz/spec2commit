@@ -1,18 +1,20 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { ClaudeResult, CodexResult, Evt } from '../types.js';
-import { CLAUDE_TIMEOUT_MS, CODEX_TIMEOUT_MS } from '../config.js';
+import type { CodexResult, ClaudeResult, Evt, ModelType } from '../types.js';
+import { CODEX_TIMEOUT_MS, CLAUDE_TIMEOUT_MS } from '../config.js';
 
-interface Opts {
+interface BaseOpts {
   cwd?: string;
   onData?: (t: string) => void;
   onEvent?: (e: Evt) => void;
 }
-interface ClaudeOpts extends Opts {
-  sessionId?: string;
-}
-interface CodexOpts extends Opts {
+
+interface CodexOpts extends BaseOpts {
   threadId?: string;
   readOnly?: boolean;
+}
+
+interface ClaudeOpts extends BaseOpts {
+  sessionId?: string;
 }
 
 interface ParsedJson {
@@ -25,22 +27,6 @@ function parseJson(s: string): ParsedJson | null {
   } catch {
     return null;
   }
-}
-
-function extractResultText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) {
-    return value
-      .filter((b: any) => b?.type === 'text')
-      .map((b: any) => String(b?.text ?? ''))
-      .join('\n');
-  }
-  if (value && typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    if (typeof obj.text === 'string') return obj.text;
-    if (Array.isArray(obj.content)) return extractResultText(obj.content);
-  }
-  return '';
 }
 
 function lines(buf: { s: string }, chunk: string, fn: (line: string) => void) {
@@ -75,6 +61,39 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       },
     );
   });
+}
+
+function extractResultText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value
+      .filter((b: any) => b?.type === 'text')
+      .map((b: any) => String(b?.text ?? ''))
+      .join('\n');
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.text === 'string') return obj.text;
+    if (Array.isArray(obj.content)) return extractResultText(obj.content);
+  }
+  return '';
+}
+
+function toolSummary(name: string, input: unknown): string {
+  const FIELDS: Record<string, string> = {
+    Read: 'file_path',
+    Write: 'file_path',
+    Edit: 'file_path',
+    Glob: 'pattern',
+    Grep: 'pattern',
+    Bash: 'command',
+    WebFetch: 'url',
+    WebSearch: 'query',
+    Task: 'description',
+  };
+  if (!input || typeof input !== 'object') return '';
+  const obj = input as Record<string, unknown>;
+  return FIELDS[name] ? String(obj[FIELDS[name]] ?? '').slice(0, 120) : JSON.stringify(input).slice(0, 120);
 }
 
 export function execClaude(prompt: string, opts: ClaudeOpts = {}): Promise<ClaudeResult> {
@@ -281,22 +300,4 @@ export function execCodex(prompt: string, opts: CodexOpts = {}): Promise<CodexRe
   });
 
   return withTimeout(inner, CODEX_TIMEOUT_MS, 'codex');
-}
-
-const FIELDS: Record<string, string> = {
-  Read: 'file_path',
-  Write: 'file_path',
-  Edit: 'file_path',
-  Glob: 'pattern',
-  Grep: 'pattern',
-  Bash: 'command',
-  WebFetch: 'url',
-  WebSearch: 'query',
-  Task: 'description',
-};
-
-function toolSummary(name: string, input: unknown): string {
-  if (!input || typeof input !== 'object') return '';
-  const obj = input as Record<string, unknown>;
-  return FIELDS[name] ? String(obj[FIELDS[name]] ?? '').slice(0, 120) : JSON.stringify(input).slice(0, 120);
 }
